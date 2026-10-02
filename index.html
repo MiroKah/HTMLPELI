@@ -1,0 +1,924 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Forest Runner</title>
+<style>
+  /* ---------- Page styling (game itself is drawn on the canvas) ---------- */
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(135deg, #1d2b1f 0%, #0d1410 100%);
+    font-family: "Courier New", Courier, monospace;
+    color: #cfe8cf;
+  }
+  #gameWrap {
+    text-align: center;
+    padding: 16px;
+  }
+  canvas {
+    display: block;
+    background: #87ceeb; /* fallback sky color before JS paints it */
+    border: 3px solid #2f4f2f;
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+    max-width: 100%;
+  }
+  /* Screenshot button below the canvas */
+  #screenshotBtn {
+    margin-top: 14px;
+    padding: 10px 22px;
+    font-family: inherit;
+    font-size: 15px;
+    font-weight: bold;
+    color: #0d1410;
+    background: #7cc47c;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s, transform 0.1s;
+  }
+  #screenshotBtn:hover { background: #9ada9a; }
+  #screenshotBtn:active { transform: scale(0.96); }
+  #hint {
+    margin-top: 10px;
+    font-size: 13px;
+    opacity: 0.75;
+  }
+</style>
+</head>
+<body>
+
+<div id="gameWrap">
+  <!-- The game is rendered entirely on this canvas -->
+  <canvas id="gameCanvas" width="900" height="300" aria-label="Forest Runner game"></canvas>
+  <br>
+  <button id="screenshotBtn" type="button">Take Screenshot</button>
+  <p id="hint">SPACE or click to jump &mdash; avoid stumps and rocks, grab coins!</p>
+</div>
+
+<script>
+'use strict';
+
+/* =====================================================================
+ * 1. VARIABLES
+ * General settings, state and cached DOM/canvas references.
+ * ===================================================================== */
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+// World constants
+const W = canvas.width;              // 900
+const H = canvas.height;             // 300
+const GROUND_Y = H - 40;             // y position of the ground line
+
+// Physics / gameplay tuning
+const BASE_SPEED = 320;              // starting speed in pixels per second
+const MAX_SPEED = 950;               // speed cap so the game stays playable
+const GRAVITY = 2300;                // downward acceleration (px/s^2)
+const JUMP_VELOCITY = -800;          // initial jump speed (negative = upward)
+
+// Game state: 'running' or 'gameover'
+let gameState = 'running';
+
+// Scoring
+let score = 0;                                   // current score (float, drawn as int)
+let highScore = 0;
+// Load saved high score safely (localStorage may be blocked in some setups)
+try {
+  highScore = parseInt(localStorage.getItem('forestRunnerHighScore'), 10) || 0;
+} catch (err) {
+  highScore = 0;
+}
+let newRecord = false;                           // true if this run beat the high score
+let survivalTime = 0;                            // seconds survived in the current run
+let gameSpeed = BASE_SPEED;                      // current world speed (px/s)
+
+// Timing
+let lastTime = 0;                                // timestamp of previous frame
+let runTime = 0;                                 // seconds since game start
+
+// Day / night cycle: darkness 0 = full day, 1 = full night.
+// The cycle flips between day and night every 30-60 seconds (randomized).
+let dayNightTimer = 0;                           // ms elapsed in current half-cycle
+let halfCycleMs = randomInRange(30000, 60000);   // 30-60 s until next flip
+let darkness = 0;                                // current blend value
+let darknessFrom = 0;                            // value the flip started from
+let darknessTo = 0;                              // 0 or 1 - where we are heading
+
+// Spawn bookkeeping (distance based so gaps scale with speed)
+let distanceSinceObstacle = 0;
+let distanceSinceCoin = 0;
+
+// Small utility: random float in [min, max]
+function randomInRange(min, max) {
+  return min + Math.random() * (max - min);
+}
+
+// Utility: axis-aligned bounding box overlap (used by collision detection)
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.w &&
+         a.x + a.w > b.x &&
+         a.y < b.y + b.h &&
+         a.y + a.h > b.y;
+}
+
+// Utility: linear interpolation between two values / colors
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+function lerpColor(c1, c2, t) {
+  return `rgb(${Math.round(lerp(c1[0], c2[0], t))},` +
+         `${Math.round(lerp(c1[1], c2[1], t))},` +
+         `${Math.round(lerp(c1[2], c2[2], t))})`;
+}
+
+/* =====================================================================
+ * 2. GAME OBJECTS
+ * The player robot, obstacles, coins and background scenery.
+ * ===================================================================== */
+
+// ---------- Player: a small robot ----------
+const robot = {
+  x: 90,                 // fixed horizontal position (left edge)
+  y: GROUND_Y,           // bottom of the robot (feet touch the ground line)
+  w: 34,
+  h: 48,
+  vy: 0,                 // vertical velocity
+  onGround: true,        // can only jump when standing on the ground
+  runFrame: 0,           // animation timer for the running legs
+  update(dt) {
+    // Apply gravity and integrate vertical movement
+    this.vy += GRAVITY * dt;
+    this.y += this.vy * dt;
+
+    // Land back on the ground
+    if (this.y >= GROUND_Y) {
+      this.y = GROUND_Y;
+      this.vy = 0;
+      this.onGround = true;
+    }
+
+    // Advance run animation only while on the ground
+    if (this.onGround) {
+      this.runFrame += dt * (gameSpeed / BASE_SPEED); // faster speed = faster legs
+    }
+  },
+  jump() {
+    if (!this.onGround) return;      // no double jumps allowed
+    this.vy = JUMP_VELOCITY;
+    this.onGround = false;
+    playJumpSound();
+  },
+  // Collision box (slightly smaller than the sprite so near-misses feel fair)
+  getHitbox() {
+    return { x: this.x + 5, y: this.y - this.h + 4, w: this.w - 10, h: this.h - 8 };
+  },
+  reset() {
+    this.y = GROUND_Y;
+    this.vy = 0;
+    this.onGround = true;
+    this.runFrame = 0;
+  }
+};
+
+// ---------- Obstacles (tree stump + rock) ----------
+// Type is 'stump' or 'rock'; each type has its own size and shape.
+let obstacles = [];
+
+function createObstacle() {
+  const type = Math.random() < 0.5 ? 'stump' : 'rock';
+  const size = randomInRange(0.85, 1.25);         // slight size variety
+  const o = { type, x: W + 20, w: 0, h: 0 };
+
+  if (type === 'stump') {
+    o.w = 30 * size;
+    o.h = 42 * size;                              // stumps are taller
+  } else {
+    o.w = 44 * size;
+    o.h = 30 * size;                              // rocks are wider/flatter
+  }
+  o.y = GROUND_Y - o.h;                           // sits on the ground line
+  return o;
+}
+
+// ---------- Coins (bonus pickups) ----------
+let coins = [];
+
+function createCoin() {
+  const c = {
+    x: W + 20,
+    y: GROUND_Y - randomInRange(50, 110),        // float in the air
+    w: 18,
+    h: 18,
+    phase: Math.random() * Math.PI * 2,           // bobbing / spin phase
+    taken: false
+  };
+  return c;
+}
+
+const COIN_POINTS = 50;                           // points awarded per coin
+
+// ---------- Clouds (parallax background) ----------
+const clouds = [];
+for (let i = 0; i < 5; i++) {
+  clouds.push({
+    x: Math.random() * W,
+    y: randomInRange(20, 110),
+    size: randomInRange(24, 46),                  // base cloud puff radius
+    speed: randomInRange(0.12, 0.3)               // parallax factor (slower than world)
+  });
+}
+
+// ---------- Stars (visible at night) ----------
+const stars = [];
+for (let i = 0; i < 40; i++) {
+  stars.push({
+    x: Math.random() * W,
+    y: Math.random() * (GROUND_Y - 80),
+    r: randomInRange(0.6, 1.8),
+    tw: Math.random() * Math.PI * 2               // twinkle phase
+  });
+}
+
+// ---------- Background forest silhouette trees (parallax) ----------
+const bgTrees = [];
+for (let i = 0; i < 12; i++) {
+  bgTrees.push({
+    x: i * 80 + Math.random() * 40,
+    h: randomInRange(60, 120),
+    speed: 0.45                                   // parallax factor
+  });
+}
+
+/* =====================================================================
+ * 3. RENDERING
+ * Everything visible is painted here with the Canvas 2D API.
+ * Draw order: sky -> stars -> sun/moon -> forest -> clouds -> ground
+ *             -> coins -> obstacles -> robot -> HUD -> overlays.
+ * ===================================================================== */
+
+// Day / night color palettes (RGB triples)
+const DAY_SKY_TOP = [110, 190, 255];
+const DAY_SKY_BOTTOM = [205, 236, 255];
+const NIGHT_SKY_TOP = [8, 12, 38];
+const NIGHT_SKY_BOTTOM = [45, 55, 95];
+const DAY_GROUND = '#6b4a2a';
+const NIGHT_GROUND = '#241a12';
+const DAY_GRASS = '#4c9a3a';
+const NIGHT_GRASS = '#1e4a20';
+
+// Small helper: rounded rectangle path (not built into older canvas)
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+// ---------- Background: sky, stars, sun/moon, forest, clouds ----------
+function drawBackground() {
+  // Sky gradient blends between the day and night palettes
+  const grad = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
+  grad.addColorStop(0, lerpColor(DAY_SKY_TOP, NIGHT_SKY_TOP, darkness));
+  grad.addColorStop(1, lerpColor(DAY_SKY_BOTTOM, NIGHT_SKY_BOTTOM, darkness));
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+
+  // Stars fade in with darkness (and twinkle)
+  if (darkness > 0.05) {
+    ctx.fillStyle = '#ffffff';
+    for (const st of stars) {
+      const tw = 0.55 + 0.45 * Math.sin(runTime * 3 + st.tw);
+      ctx.globalAlpha = darkness * tw;
+      ctx.beginPath();
+      ctx.arc(st.x, st.y, st.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // Sun (day) and moon (night) share one spot and cross-fade
+  const cx = W - 130, cy = 62;
+
+  if (darkness < 0.98) {           // sun
+    ctx.globalAlpha = 1 - darkness;
+    ctx.fillStyle = '#ffd94a';
+    ctx.beginPath(); ctx.arc(cx, cy, 26, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#fff3b0';
+    ctx.beginPath(); ctx.arc(cx, cy, 19, 0, Math.PI * 2); ctx.fill();
+  }
+  if (darkness > 0.02) {           // moon
+    ctx.globalAlpha = darkness;
+    ctx.fillStyle = '#e8ecf5';
+    ctx.beginPath(); ctx.arc(cx, cy, 22, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = lerpColor(DAY_SKY_TOP, NIGHT_SKY_TOP, darkness); // crescent bite
+    ctx.beginPath(); ctx.arc(cx + 9, cy - 6, 19, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // Distant forest silhouette (parallax layer behind everything)
+  const forestCol = lerpColor([92, 148, 88], [14, 30, 30], darkness);
+  ctx.fillStyle = forestCol;
+  for (const t of bgTrees) {
+    const tx = ((t.x - groundOffset * t.speed * 0.5) % (W + 120) + W + 120) % (W + 120) - 60;
+    // Simple triangular pine tree
+    ctx.beginPath();
+    ctx.moveTo(tx, GROUND_Y);
+    ctx.lineTo(tx - 22, GROUND_Y);
+    ctx.lineTo(tx - 11, GROUND_Y - t.h);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(tx - 6, GROUND_Y);
+    ctx.lineTo(tx + 16, GROUND_Y);
+    ctx.lineTo(tx + 5, GROUND_Y - t.h * 0.9);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // Animated clouds (they keep drifting even on the game over screen)
+  const cloudCol = lerpColor([255, 255, 255], [120, 130, 165], darkness);
+  ctx.fillStyle = cloudCol;
+  for (const c of clouds) {
+    drawCloud(c.x, c.y, c.size);
+  }
+}
+
+// Draws one puffy cloud from overlapping circles
+function drawCloud(x, y, s) {
+  ctx.beginPath();
+  ctx.arc(x, y, s * 0.55, 0, Math.PI * 2);
+  ctx.arc(x + s * 0.5, y - s * 0.18, s * 0.45, 0, Math.PI * 2);
+  ctx.arc(x + s * 1.0, y, s * 0.5, 0, Math.PI * 2);
+  ctx.arc(x + s * 0.5, y + s * 0.12, s * 0.42, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// ---------- Ground line with scrolling texture ----------
+let groundOffset = 0; // scrolls with the world to sell the running effect
+
+function drawGround() {
+  // Dirt below the ground line
+  ctx.fillStyle = lerpColor(hexToRgb(DAY_GROUND), hexToRgb(NIGHT_GROUND), darkness);
+  ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
+
+  // Grass strip on top of the dirt
+  ctx.fillStyle = lerpColor(hexToRgb(DAY_GRASS), hexToRgb(NIGHT_GRASS), darkness);
+  ctx.fillRect(0, GROUND_Y - 5, W, 6);
+
+  // The actual ground line
+  ctx.strokeStyle = lerpColor(hexToRgb(DAY_GRASS), hexToRgb(NIGHT_GRASS), darkness);
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(0, GROUND_Y + 1);
+  ctx.lineTo(W, GROUND_Y + 1);
+  ctx.stroke();
+
+  // Scrolling grass tufts / pebbles so movement is visible
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  for (let i = 0; i < 14; i++) {
+    const gx = ((i * 70 - groundOffset) % W + W) % W;
+    ctx.fillRect(gx, GROUND_Y + 8 + (i % 3) * 7, 14, 3);
+  }
+}
+
+// Converts '#rrggbb' to an [r,g,b] array (for lerpColor)
+function hexToRgb(hex) {
+  return [
+    parseInt(hex.slice(1, 3), 16),
+    parseInt(hex.slice(3, 5), 16),
+    parseInt(hex.slice(5, 7), 16)
+  ];
+}
+
+// ---------- Robot sprite (hand-drawn, slightly animated while running) ----------
+// Coordinate origin is the robot's feet (bottom-left). Sizes are in pixels:
+// legs 16, torso 18, head 15 => total height ~48 (matches robot.h).
+function drawRobot() {
+  const airborne = !robot.onGround;
+  const swing = Math.sin(robot.runFrame * 14);   // -1..1 leg cycle
+  const bob = airborne ? 0 : Math.abs(swing) * 1.5; // tiny vertical bounce
+
+  ctx.save();
+  ctx.translate(robot.x, robot.y - bob);
+
+  // Helper: draws a thick line segment (used for legs and arms)
+  function limb(x1, y1, x2, y2) {
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+  }
+
+  // ---- Arms (behind the body) ----
+  ctx.strokeStyle = '#8a93a1';
+  ctx.lineWidth = 6;
+  ctx.lineCap = 'round';
+  if (airborne) {                 // arms raised while jumping
+    limb(6, -30, 0, -40);
+    limb(28, -30, 34, -40);
+  } else {                        // arms swing opposite to the legs
+    limb(6, -30, 6 - swing * 7, -20);
+    limb(28, -30, 28 + swing * 7, -20);
+  }
+
+  // ---- Legs ----
+  ctx.strokeStyle = '#7d8796';
+  ctx.lineWidth = 7;
+  if (airborne) {                 // tucked legs in the air
+    limb(11, -16, 17, -6);
+    limb(23, -16, 29, -6);
+  } else {                        // alternating run cycle
+    limb(11, -16, 11 + swing * 9, 0);
+    limb(23, -16, 23 - swing * 9, 0);
+  }
+  // Small feet
+  ctx.fillStyle = '#5b6675';
+  if (airborne) {
+    ctx.fillRect(13, -7, 9, 5);
+    ctx.fillRect(25, -7, 9, 5);
+  } else {
+    ctx.fillRect(7 + swing * 9, -3, 10, 5);
+    ctx.fillRect(19 - swing * 9, -3, 10, 5);
+  }
+
+  // ---- Torso ----
+  const bodyGrad = ctx.createLinearGradient(0, -34, 0, -16);
+  bodyGrad.addColorStop(0, '#d3dae4');
+  bodyGrad.addColorStop(1, '#9aa3b1');
+  ctx.fillStyle = bodyGrad;
+  roundRect(3, -34, 28, 18, 5);
+  ctx.fill();
+  ctx.strokeStyle = '#6f7887';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Chest indicator light (blinks)
+  ctx.fillStyle = (Math.floor(runTime * 2) % 2 === 0) ? '#7cc47c' : '#3f7a42';
+  ctx.beginPath();
+  ctx.arc(17, -25, 3.5, 0, Math.PI * 2);
+  ctx.fill();
+
+  // ---- Head ----
+  const headGrad = ctx.createLinearGradient(0, -48, 0, -33);
+  headGrad.addColorStop(0, '#e2e7ee');
+  headGrad.addColorStop(1, '#a7b0be');
+  ctx.fillStyle = headGrad;
+  roundRect(4, -48, 26, 15, 4);
+  ctx.fill();
+  ctx.strokeStyle = '#6f7887';
+  ctx.stroke();
+
+  // Visor + glowing eye
+  ctx.fillStyle = '#2b3140';
+  roundRect(8, -45, 19, 9, 3);
+  ctx.fill();
+  ctx.fillStyle = '#4df0ff';
+  ctx.shadowColor = '#4df0ff';
+  ctx.shadowBlur = 6;
+  ctx.fillRect(17, -43, 7, 5);   // eye looks forward (to the right)
+  ctx.shadowBlur = 0;
+
+  // ---- Antenna (wiggles slightly) ----
+  ctx.strokeStyle = '#6f7887';
+  ctx.lineWidth = 2;
+  const wig = Math.sin(runTime * 8) * 2;
+  limb(17, -48, 17 + wig, -57);
+  ctx.fillStyle = '#ff5f5f';
+  ctx.beginPath();
+  ctx.arc(17 + wig, -58, 3, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.restore();
+}
+
+// ---------- Obstacle sprites ----------
+function drawObstacle(o) {
+  ctx.save();
+  ctx.translate(o.x, o.y);
+
+  if (o.type === 'stump') {
+    const w = o.w, h = o.h;
+    ctx.fillStyle = '#6b4226';                     // trunk
+    roundRect(0, 0, w, h, 4);
+    ctx.fill();
+    ctx.fillStyle = '#7d5030';                     // bark highlight
+    ctx.fillRect(w * 0.2, 0, w * 0.18, h);
+    ctx.fillStyle = '#a9743f';                     // cut top with rings
+    ctx.beginPath();
+    ctx.ellipse(w / 2, 3, w / 2, 6, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#6b4226';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.ellipse(w / 2, 3, w / 4, 3, 0, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = '#5a3720';                     // roots
+    ctx.fillRect(-3, h - 6, 8, 6);
+    ctx.fillRect(w - 5, h - 6, 8, 6);
+    ctx.fillStyle = '#e05b4b';                     // tiny mushroom
+    ctx.beginPath();
+    ctx.arc(w - 4, h - 8, 4, Math.PI, 0);
+    ctx.fill();
+    ctx.fillStyle = '#f2ede0';
+    ctx.fillRect(w - 5, h - 8, 2, 4);
+  } else {
+    const w = o.w, h = o.h;                        // rock
+    ctx.fillStyle = '#7d838c';
+    ctx.beginPath();
+    ctx.moveTo(0, h);
+    ctx.lineTo(w * 0.12, h * 0.45);
+    ctx.lineTo(w * 0.35, h * 0.08);
+    ctx.lineTo(w * 0.62, 0);
+    ctx.lineTo(w * 0.88, h * 0.4);
+    ctx.lineTo(w, h);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = '#9aa1ab';                     // sunlit top face
+    ctx.beginPath();
+    ctx.moveTo(w * 0.3, h * 0.35);
+    ctx.lineTo(w * 0.38, h * 0.12);
+    ctx.lineTo(w * 0.6, h * 0.05);
+    ctx.lineTo(w * 0.7, h * 0.35);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';            // shadowed base
+    ctx.fillRect(w * 0.1, h * 0.75, w * 0.8, h * 0.25);
+  }
+  ctx.restore();
+}
+
+// ---------- Coin sprite (spins and bobs) ----------
+function drawCoin(c) {
+  const spin = Math.abs(Math.cos(runTime * 6 + c.phase)); // horizontal squash = spin
+  const bobY = Math.sin(runTime * 3 + c.phase) * 4;
+  const cx = c.x + c.w / 2;
+  const cy = c.y + c.h / 2 + bobY;
+  const rx = (c.w / 2) * Math.max(spin, 0.15);
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.fillStyle = '#ffd54a';
+  ctx.beginPath();
+  ctx.ellipse(0, 0, rx, c.h / 2, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#d99a17';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  if (spin > 0.4) {                                // inner mark when face shows
+    ctx.fillStyle = '#e0a71e';
+    ctx.beginPath();
+    ctx.arc(0, 0, c.h / 5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+// ---------- HUD: score (top-left), high score, game speed ----------
+function drawHUD() {
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold 20px "Courier New", monospace';
+
+  const scoreText = 'SCORE ' + String(Math.floor(score)).padStart(5, '0');
+  const hiText = 'HI ' + String(highScore).padStart(5, '0');
+  const speedText = 'SPEED x' + (gameSpeed / BASE_SPEED).toFixed(2);
+  const speedW = ctx.measureText(speedText).width;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';              // drop shadow
+  ctx.fillText(scoreText, 17, 17);
+  ctx.fillText(hiText, 17, 41);
+  ctx.fillText(speedText, W - speedW - 15, 17);
+
+  ctx.fillStyle = '#ffffff';                       // real text
+  ctx.fillText(scoreText, 16, 16);
+  ctx.fillText(hiText, 16, 40);
+  ctx.fillStyle = '#ffe27a';
+  ctx.fillText(speedText, W - speedW - 16, 16);
+}
+
+// ---------- Game over overlay ----------
+function drawGameOver() {
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ff6b5f';
+  ctx.font = 'bold 46px "Courier New", monospace';
+  ctx.fillText('GAME OVER', W / 2, H / 2 - 42);
+
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 20px "Courier New", monospace';
+  ctx.fillText('Press SPACE to restart', W / 2, H / 2 + 4);
+
+  ctx.font = '16px "Courier New", monospace';
+  ctx.fillStyle = '#cfe8cf';
+  ctx.fillText('Score: ' + Math.floor(score) + '   High Score: ' + highScore,
+               W / 2, H / 2 + 36);
+  if (newRecord) {
+    ctx.fillStyle = '#ffe27a';
+    ctx.fillText('NEW HIGH SCORE!', W / 2, H / 2 + 62);
+  }
+  ctx.textAlign = 'left';
+}
+
+/* =====================================================================
+ * 4. COLLISION DETECTION
+ * Simple AABB tests between the robot's hitbox and other objects.
+ * ===================================================================== */
+
+function checkCollisions() {
+  const hit = robot.getHitbox();
+
+  // --- Obstacles: any hit ends the game ---
+  for (const o of obstacles) {
+    if (rectsOverlap(hit, o)) {
+      triggerGameOver();
+      return;
+    }
+  }
+
+  // --- Coins: collect for bonus points ---
+  for (const c of coins) {
+    if (c.taken) continue;
+    // Slightly generous box so grabbing coins feels satisfying
+    const box = { x: c.x - 6, y: c.y - 6, w: c.w + 12, h: c.h + 12 };
+    if (rectsOverlap(hit, box)) {
+      c.taken = true;
+      score += COIN_POINTS;
+      playCoinSound();
+    }
+  }
+}
+
+// Ends the run: plays sound, persists the high score, switches state.
+function triggerGameOver() {
+  if (gameState === 'gameover') return;
+  gameState = 'gameover';
+
+  const finalScore = Math.floor(score);
+  newRecord = finalScore > highScore;
+  if (newRecord) {
+    highScore = finalScore;
+    // High score persists across refreshes / reopens via localStorage
+    try {
+      localStorage.setItem('forestRunnerHighScore', String(highScore));
+    } catch (err) { /* storage unavailable - score only lives this session */ }
+  }
+  playGameOverSound();
+}
+
+/* =====================================================================
+ * 5. SOUND SYSTEM
+ * All sounds are synthesized with the Web Audio API - no audio files.
+ * ===================================================================== */
+
+let audioCtx = null;
+
+// Browsers require the AudioContext to be created/resumed from a user
+// gesture, so we fetch it lazily on the first input.
+function getAudioContext() {
+  if (!audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (AC) audioCtx = new AC();
+  }
+  if (audioCtx && audioCtx.state === 'suspended') {
+    audioCtx.resume();
+  }
+  return audioCtx;
+}
+
+// Core helper: plays a tone that can sweep from startFreq to endFreq.
+function playTone(type, startFreq, endFreq, duration, volume) {
+  const ac = getAudioContext();
+  if (!ac) return; // Web Audio not supported - fail silently
+
+  const osc = ac.createOscillator();
+  const gain = ac.createGain();
+  const now = ac.currentTime;
+
+  osc.type = type;
+  osc.frequency.setValueAtTime(startFreq, now);
+  osc.frequency.exponentialRampToValueAtTime(Math.max(endFreq, 1), now + duration);
+
+  gain.gain.setValueAtTime(volume, now);
+  gain.gain.exponentialRampToValueAtTime(0.001, now + duration);
+
+  osc.connect(gain);
+  gain.connect(ac.destination);
+  osc.start(now);
+  osc.stop(now + duration);
+}
+
+// Jump: quick rising blip
+function playJumpSound() {
+  playTone('square', 250, 620, 0.16, 0.12);
+}
+
+// Coin: two short high notes (classic pickup arpeggio)
+function playCoinSound() {
+  playTone('sine', 880, 880, 0.07, 0.14);
+  setTimeout(() => playTone('sine', 1320, 1320, 0.1, 0.14), 70);
+}
+
+// Game over: descending sawtooth buzz
+function playGameOverSound() {
+  playTone('sawtooth', 420, 70, 0.55, 0.18);
+}
+
+/* =====================================================================
+ * 6. GAME LOOP (update + render + requestAnimationFrame)
+ * ===================================================================== */
+
+// Initializes a fresh run (used at start and on restart)
+function resetGame() {
+  gameState = 'running';
+  score = 0;
+  survivalTime = 0;
+  newRecord = false;
+  gameSpeed = BASE_SPEED;
+  obstacles = [];
+  coins = [];
+  distanceSinceObstacle = 0;
+  distanceSinceCoin = 0;
+  nextObstacleGap = 400;
+  nextCoinGap = randomInRange(500, 1000);
+  robot.reset();
+}
+
+// Spawning distances (how far the world must travel between spawns)
+let nextObstacleGap = 400;
+let nextCoinGap = randomInRange(500, 1000);
+
+// Advances the day/night cycle (runs during gameplay AND game over)
+function updateDayNight(dtMs) {
+  dayNightTimer += dtMs;
+  if (dayNightTimer >= halfCycleMs) {
+    // Flip direction: day -> night or night -> day
+    dayNightTimer = 0;
+    darknessFrom = darknessTo;
+    darknessTo = darknessTo === 0 ? 1 : 0;
+    halfCycleMs = randomInRange(30000, 60000); // next flip in 30-60 s
+  }
+  // Smoothstep easing so the sky fades naturally
+  const p = dayNightTimer / halfCycleMs;
+  const eased = p * p * (3 - 2 * p);
+  darkness = darknessFrom + (darknessTo - darknessFrom) * eased;
+}
+
+// Drifts the clouds left and wraps them around (parallax)
+function updateClouds(dt) {
+  for (const c of clouds) {
+    c.x -= gameSpeed * c.speed * dt;
+    if (c.x < -c.size * 1.6) {
+      c.x = W + c.size;
+      c.y = randomInRange(20, 110);
+      c.size = randomInRange(24, 46);
+    }
+  }
+}
+
+// Full per-frame simulation while the game is running
+function update(dt) {
+  // --- Difficulty: speed grows with score AND survival time (capped) ---
+  survivalTime += dt;
+  gameSpeed = Math.min(MAX_SPEED, BASE_SPEED + score * 0.15 + survivalTime * 3);
+
+  // --- Score: continuous survival points, faster at higher speeds ---
+  score += dt * 10 * (gameSpeed / BASE_SPEED);
+
+  // --- Ambient animation ---
+  updateDayNight(dt * 1000);
+  updateClouds(dt);
+  groundOffset += gameSpeed * dt; // scrolls ground texture & background trees
+
+  // --- Player physics ---
+  robot.update(dt);
+
+  // --- Move obstacles left and recycle the ones that left the screen ---
+  for (const o of obstacles) o.x -= gameSpeed * dt;
+  obstacles = obstacles.filter(o => o.x + o.w > -20);
+
+  // --- Spawn obstacles at distance-based gaps (gap shrinks feel with speed) ---
+  distanceSinceObstacle += gameSpeed * dt;
+  if (distanceSinceObstacle >= nextObstacleGap) {
+    distanceSinceObstacle = 0;
+    obstacles.push(createObstacle());
+    // Gap measured in seconds of reaction time: 0.9 - 1.6 s
+    nextObstacleGap = gameSpeed * randomInRange(0.9, 1.6);
+  }
+
+  // --- Coins: spawn periodically so bonus jumps are worth taking ---
+  distanceSinceCoin += gameSpeed * dt;
+  if (distanceSinceCoin >= nextCoinGap) {
+    distanceSinceCoin = 0;
+    coins.push(createCoin());
+    nextCoinGap = randomInRange(500, 1100);
+  }
+  for (const c of coins) c.x -= gameSpeed * dt;
+  coins = coins.filter(c => !c.taken && c.x + c.w > -20);
+
+  // --- Collisions resolve the run ---
+  checkCollisions();
+}
+
+// Paints the whole frame
+function render() {
+  drawBackground();
+  drawGround();
+  for (const c of coins) drawCoin(c);
+  for (const o of obstacles) drawObstacle(o);
+  drawRobot();
+  drawHUD();
+  if (gameState === 'gameover') drawGameOver();
+}
+
+// Main loop: fixed to real time via delta seconds (capped to avoid tunneling)
+function gameLoop(timestamp) {
+  // Delta time in seconds, clamped to [0, 0.05] to avoid physics jumps
+  // after tab switches or timestamp hiccups
+  const dt = Math.min(Math.max((timestamp - lastTime) / 1000 || 0, 0), 0.05);
+  lastTime = timestamp;
+  runTime += dt;
+
+  if (gameState === 'running') {
+    update(dt);
+  } else {
+    // On game over only ambient motion continues (sky, clouds)
+    updateDayNight(dt * 1000);
+    updateClouds(dt);
+  }
+
+  render();
+  requestAnimationFrame(gameLoop);
+}
+
+/* =====================================================================
+ * 7. INPUT HANDLING
+ * SPACE or mouse click = jump. SPACE also restarts after game over.
+ * ===================================================================== */
+
+// Single entry point for "action" input (jump / restart)
+function handleAction() {
+  getAudioContext(); // unlock audio from the user gesture
+
+  if (gameState === 'gameover') {
+    resetGame();                 // SPACE restarts the game
+  } else {
+    robot.jump();                // only works when standing on the ground
+  }
+}
+
+// Keyboard: SPACE (prevents the page from scrolling)
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    handleAction();
+  }
+});
+
+// Mouse / touch: clicking the canvas jumps too
+canvas.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  handleAction();
+});
+
+/* ---------- Screenshot button (below the canvas) ---------- */
+document.getElementById('screenshotBtn').addEventListener('click', () => {
+  // Serialize the current canvas frame as a PNG data URL
+  const dataURL = canvas.toDataURL('image/png');
+  const link = document.createElement('a');
+  link.href = dataURL;
+  link.download = 'forest-runner-' + new Date().toISOString().replace(/[:.]/g, '-') + '.png';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+});
+
+/* ---------- Start the game ---------- */
+resetGame();                     // ensure clean initial state
+lastTime = performance.now();
+requestAnimationFrame(gameLoop); // kick off the main loop
+
+
+
+
+
+
+
+
+
+
+
+
+
+</script>
+</body>
+</html>
